@@ -238,13 +238,14 @@ async def monitor_runs():
 # ---------------------- COMMANDS ----------------------
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setchannel(ctx, channel: discord.TextChannel):
-    """Set the channel the bot should send messages to."""
+async def setchannel(ctx):
+    """Bind the bot to the current channel."""
     global CHANNEL_ID, bot_config
-    CHANNEL_ID = channel.id
+    CHANNEL_ID = ctx.channel.id
     bot_config["channel_id"] = CHANNEL_ID
     save_config(bot_config)
-    await ctx.send(f"✅ Channel set to {channel.mention} (ID: {CHANNEL_ID})")
+    await ctx.send(f"✅ This channel is now set for notifications! (ID: {CHANNEL_ID})")
+
 
 @bot.command()
 async def test(ctx):
