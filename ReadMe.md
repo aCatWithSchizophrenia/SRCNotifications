@@ -48,22 +48,38 @@ Guide:
   4. run the code
   5. go to the channel you want the bot to post in and use !setchannel
 
-# Command Explanations
+Command Explanations
 
-## 🛠️ Admin Commands
-**!setchannel** - Bind notifications to current channel  
-**!setrole @Role** - Set role to ping for new runs  
-**!setgames game1 game2** - Update monitored games list  
-**!interval minutes** - Change check frequency (minutes)  
-**!resetseen** - Clear seen runs history
+🛠️ Admin Commands
 
-## 📊 Info Commands  
-**!help** - Show all commands  
-**!test** - Check bot responsiveness  
-**!stats** - Display monitoring statistics  
-**!last [n]** - Show last n announced runs (default: 5)
+    !setchannel: Bind notifications to the current channel.
 
+    !setrole @Role: Set a specific role to be pinged for new runs.
+
+    !setgames game1 game2 ...: Update the list of games the bot monitors. Separate each game name with a space.
+
+    !interval [seconds]: Change the frequency of the bot's check for new runs. The time is set in seconds.
+
+    !resetseen: Clear the bot's history of seen runs, forcing it to check all recent runs on the next scan.
+
+    !clearconfig: Reset the bot's configuration (channel_id, role_id, games, and interval) to its default settings.
+
+📊 Info Commands
+
+    !help: Display a complete list of all available bot commands.
+
+    !test: A simple command to check if the bot is responsive and working.
+
+    !config: Show the bot's current settings, including games, channel, role, and check interval.
+
+    !last [n]: Show the weblinks for the last n runs the bot has announced (defaults to 5 if no number is specified).
+
+🔍 Debugging & Manual Commands
+
+    !checknow: Manually trigger an immediate check for new runs, bypassing the scheduled interval. The bot will report its findings directly in the channel.
+
+    !debuggames: A diagnostic tool that shows the bot's internal matching status for each game you've configured. This is useful for troubleshooting if a game isn't being detected correctly.
 
 Made by Lasse Pfannenschmidt
 
-for questions add: __**acatwithschizophrenia**__ on discord 
+For questions or issues, feel free to add me on Discord: acatwithschizophrenia
