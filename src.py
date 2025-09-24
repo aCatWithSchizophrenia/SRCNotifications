@@ -40,11 +40,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
-<<<<<<< HEAD
     return {"channel_id": None, "role_id": None, "games": ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"], "interval": 1}
-=======
-    return {"channel_id": None, "role_id": None, "games": ["Destiny 2"], "interval": 1}
->>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 
 def save_config(config):
     with open(CONFIG_FILE, "w") as f:
@@ -54,11 +50,7 @@ def save_config(config):
 bot_config = load_config()
 CHANNEL_ID = bot_config.get("channel_id")
 ROLE_ID = bot_config.get("role_id")
-<<<<<<< HEAD
 ALLOWED_GAME_NAMES = bot_config.get("games", ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"])
-=======
-ALLOWED_GAME_NAMES = bot_config.get("games", ["Destiny 2"])
->>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 INTERVAL_MINUTES = bot_config.get("interval", 1)
 
 last_announced_runs = []  # store run_ids for !last
@@ -306,8 +298,8 @@ async def stats(ctx):
         f"🔎 Monitoring: {len(ALLOWED_GAME_NAMES)} games\n"
         f"👀 Seen runs: {len(seen_runs)}\n"
         f"⏱️ Interval: {INTERVAL_MINUTES} min\n"
-        f"📢 Notifications channel: {CHANNEL_ID}\n"
-        f"🔔 Ping role: {ROLE_ID if ROLE_ID else 'None'}"
+        f"📢 Notifications channel: <#{CHANNEL_ID}>\n"
+        f"🔔 Ping role: <@&{ROLE_ID if ROLE_ID else 'None'}>"
     )
 
 @bot.command()
@@ -330,7 +322,6 @@ async def resetseen(ctx):
 async def test(ctx):
     await ctx.send("✅ Bot is working!")
 
-<<<<<<< HEAD
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -362,8 +353,6 @@ async def clearconfig(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error clearing config: {e}")
 
-=======
->>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 @bot.command()
 async def help(ctx):
     embed = discord.Embed(
@@ -373,7 +362,7 @@ async def help(ctx):
     )
     embed.add_field(name="!help", value="Show this help message.", inline=False)
     embed.add_field(name="!test", value="Check if the bot is working.", inline=False)
-    embed.add_field(name="!stats", value="Show monitoring stats (games, runs, interval, etc.).", inline=False)
+    embed.add_field(name="!config", value="Show the bot settigns (games, runs, interval, etc.).", inline=False)
     embed.add_field(name="!last [n]", value="Show the last *n* announced runs (default 5).", inline=False)
     embed.add_field(name="!resetseen", value="Clear the seen runs history. (Admin only)", inline=False)
     embed.add_field(name="!setchannel", value="Bind the bot to the current channel. (Admin only)", inline=False)
