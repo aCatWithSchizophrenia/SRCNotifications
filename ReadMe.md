@@ -17,6 +17,6 @@ Guide:
   4. run the code
   5. go to the channel you want the bot to post in and use !setchannel
 
-
+Made by Lasse Pfannenschmidt
 
 for questions add: __**acatwithschizophrenia**__ on discord 
