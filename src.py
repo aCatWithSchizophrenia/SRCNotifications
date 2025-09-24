@@ -40,7 +40,11 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
+<<<<<<< HEAD
+    return {"channel_id": None, "role_id": None, "games": ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"], "interval": 1}
+=======
     return {"channel_id": None, "role_id": None, "games": ["Destiny 2"], "interval": 1}
+>>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 
 def save_config(config):
     with open(CONFIG_FILE, "w") as f:
@@ -50,7 +54,11 @@ def save_config(config):
 bot_config = load_config()
 CHANNEL_ID = bot_config.get("channel_id")
 ROLE_ID = bot_config.get("role_id")
+<<<<<<< HEAD
+ALLOWED_GAME_NAMES = bot_config.get("games", ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"])
+=======
 ALLOWED_GAME_NAMES = bot_config.get("games", ["Destiny 2"])
+>>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 INTERVAL_MINUTES = bot_config.get("interval", 1)
 
 last_announced_runs = []  # store run_ids for !last
@@ -322,6 +330,40 @@ async def resetseen(ctx):
 async def test(ctx):
     await ctx.send("✅ Bot is working!")
 
+<<<<<<< HEAD
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clearconfig(ctx):
+    """Clear the config.json file"""
+    try:
+        # Reset to default configuration
+        default_config = {
+            "channel_id": None,
+            "role_id": None,
+            "games": ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"],
+            "interval": 1
+        }
+
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(default_config, f, indent=4)
+
+        # Reload the configuration
+        global bot_config, CHANNEL_ID, ROLE_ID, ALLOWED_GAME_NAMES, INTERVAL_MINUTES
+        bot_config = default_config
+        CHANNEL_ID = None
+        ROLE_ID = None
+        ALLOWED_GAME_NAMES = ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"]
+        INTERVAL_MINUTES = 1
+        monitor_runs.change_interval(minutes=INTERVAL_MINUTES)
+
+        await ctx.send("✅ Config cleared! All settings reset to defaults.")
+
+    except Exception as e:
+        await ctx.send(f"❌ Error clearing config: {e}")
+
+=======
+>>>>>>> parent of cf53c11 (Update: Overall imporvements.)
 @bot.command()
 async def help(ctx):
     embed = discord.Embed(
