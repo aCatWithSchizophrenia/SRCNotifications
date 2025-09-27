@@ -318,7 +318,7 @@ async def notify_new_run(session, run, game_name):
         embed = discord.Embed(
             title=f"🚨 New {game_name} Speedrun Needs Verification!",
             url=weblink,
-            description=f"A new run for **{game_name}** was submitted and is awaiting verification.",
+            description=f"A new run for **{game_name}** was submitted and is awaiting verification. <@&{ROLE_ID}>",
             color=discord.Color.red()
         )
         embed.add_field(name="🏃 Runner", value=runner, inline=True)
