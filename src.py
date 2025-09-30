@@ -8,6 +8,8 @@ from discord.ext import tasks, commands
 from dotenv import load_dotenv
 from datetime import datetime
 import sys
+import sqlite3
+from typing import List, Dict, Optional, Tuple
 
 # ---------------------- CONFIG ----------------------
 load_dotenv()
@@ -17,8 +19,7 @@ if not DISCORD_BOT_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN not set in .env!")
 
 BASE_URL = "https://www.speedrun.com/api/v1"
-SEEN_RUNS_FILE = "seen_runs.json"
-CONFIG_FILE = "config.json"
+DATABASE_FILE = "speedrun_bot.db"
 LOG_FILE = f"logs/bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 # Create logs directory if it doesn't exist
@@ -64,68 +65,307 @@ logger.info("=" * 60)
 logger.info(f"🚀 SRC Bot Session Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 logger.info("=" * 60)
 
-# ---------------------- LOAD STATE ----------------------
-if os.path.exists(SEEN_RUNS_FILE):
-    with open(SEEN_RUNS_FILE, "r") as f:
-        try:
-            seen_runs = set(json.load(f))
-            logger.info(f"📁 Loaded {len(seen_runs)} seen runs from history")
-        except Exception as e:
-            logger.warning(f"❌ Failed to load seen runs: {e}, starting fresh")
-            seen_runs = set()
-else:
-    logger.info("📁 No seen runs history found, starting fresh")
-    seen_runs = set()
-
-# Default configuration template
-DEFAULT_SERVER_CONFIG = {
-    "channel_id": None,
-    "role_id": None,
-    "games": ["Destiny 2", "Destiny 2 Misc", "Destiny 2 Portal", "Destiny 2 Lost Sectors", "Destiny 2 Story"],
-    "interval": 60,
-    "enabled": True
-}
-
-def load_config():
-    """Load configuration with server-specific settings"""
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-            logger.info("📋 Config loaded successfully")
-            return config
-    logger.info("📋 No config found, using defaults")
-    return {"servers": {}}
-
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    logger.info("💾 Config saved")
-
-def get_server_config(guild_id):
-    """Get server-specific configuration"""
-    guild_id = str(guild_id)
-    if guild_id not in bot_config["servers"]:
-        # Initialize with default config for this server
-        bot_config["servers"][guild_id] = DEFAULT_SERVER_CONFIG.copy()
-        save_config(bot_config)
-        logger.info(f"🆕 Initialized config for server {guild_id}")
-    return bot_config["servers"][guild_id]
-
-def update_server_config(guild_id, updates):
-    """Update server-specific configuration"""
-    guild_id = str(guild_id)
-    if guild_id not in bot_config["servers"]:
-        bot_config["servers"][guild_id] = DEFAULT_SERVER_CONFIG.copy()
+# ---------------------- DATABASE MANAGER ----------------------
+class DatabaseManager:
+    def __init__(self, db_file: str):
+        self.db_file = db_file
+        self.init_database()
     
-    bot_config["servers"][guild_id].update(updates)
-    save_config(bot_config)
-    logger.info(f"⚙️ Updated config for server {guild_id}")
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a database connection with row factory"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_database(self):
+        """Initialize database tables"""
+        with self.get_connection() as conn:
+            # Servers table
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS servers (
+                    guild_id TEXT PRIMARY KEY,
+                    guild_name TEXT NOT NULL,
+                    channel_id TEXT,
+                    role_id TEXT,
+                    interval INTEGER DEFAULT 60,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Games table (global game cache)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS games (
+                    game_id TEXT PRIMARY KEY,
+                    game_name TEXT NOT NULL,
+                    abbreviation TEXT,
+                    release_year INTEGER,
+                    players INTEGER,
+                    links TEXT,
+                    verified BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Server games junction table (which games each server monitors)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS server_games (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    game_name TEXT NOT NULL,
+                    game_id TEXT,
+                    custom_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (guild_id) REFERENCES servers (guild_id),
+                    FOREIGN KEY (game_id) REFERENCES games (game_id),
+                    UNIQUE(guild_id, game_name)
+                )
+            ''')
+            
+            # Seen runs table
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS seen_runs (
+                    run_id TEXT PRIMARY KEY,
+                    game_id TEXT NOT NULL,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Game search cache table
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS game_search_cache (
+                    search_term TEXT PRIMARY KEY,
+                    matches TEXT,  -- JSON array of matches
+                    searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+        logger.info("💾 Database initialized successfully")
+    
+    # Server management methods
+    def get_server(self, guild_id: str) -> Optional[sqlite3.Row]:
+        """Get server configuration"""
+        with self.get_connection() as conn:
+            result = conn.execute(
+                'SELECT * FROM servers WHERE guild_id = ?', 
+                (str(guild_id),)
+            ).fetchone()
+            return result
+    
+    def create_server(self, guild_id: str, guild_name: str) -> bool:
+        """Create a new server entry"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    '''INSERT OR REPLACE INTO servers (guild_id, guild_name, updated_at) 
+                       VALUES (?, ?, CURRENT_TIMESTAMP)''',
+                    (str(guild_id), guild_name)
+                )
+                conn.commit()
+            logger.info(f"🆕 Created server record: {guild_name} ({guild_id})")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to create server: {e}")
+            return False
+    
+    def update_server(self, guild_id: str, **updates) -> bool:
+        """Update server configuration"""
+        try:
+            with self.get_connection() as conn:
+                set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
+                values = list(updates.values())
+                values.append(str(guild_id))
+                
+                conn.execute(
+                    f'''UPDATE servers SET {set_clause}, updated_at = CURRENT_TIMESTAMP 
+                        WHERE guild_id = ?''',
+                    values
+                )
+                conn.commit()
+            logger.info(f"⚙️ Updated server {guild_id}: {updates}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to update server: {e}")
+            return False
+    
+    # Game management methods
+    def get_game(self, game_id: str) -> Optional[sqlite3.Row]:
+        """Get game by ID"""
+        with self.get_connection() as conn:
+            return conn.execute(
+                'SELECT * FROM games WHERE game_id = ?', 
+                (game_id,)
+            ).fetchone()
+    
+    def add_game(self, game_id: str, game_name: str, **kwargs) -> bool:
+        """Add or update a game"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    '''INSERT OR REPLACE INTO games 
+                       (game_id, game_name, abbreviation, release_year, players, links, verified) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (game_id, game_name, kwargs.get('abbreviation'), kwargs.get('release_year'),
+                     kwargs.get('players'), json.dumps(kwargs.get('links', [])), True)
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to add game: {e}")
+            return False
+    
+    def search_games_cache(self, search_term: str) -> Optional[List[Dict]]:
+        """Get cached game search results"""
+        with self.get_connection() as conn:
+            result = conn.execute(
+                'SELECT matches FROM game_search_cache WHERE search_term = ?',
+                (search_term.lower(),)
+            ).fetchone()
+            if result:
+                return json.loads(result['matches'])
+            return None
+    
+    def cache_game_search(self, search_term: str, matches: List[Dict]):
+        """Cache game search results"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    '''INSERT OR REPLACE INTO game_search_cache 
+                       (search_term, matches, searched_at) VALUES (?, ?, CURRENT_TIMESTAMP)''',
+                    (search_term.lower(), json.dumps(matches))
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Failed to cache search: {e}")
+    
+    # Server-game relationship methods
+    def get_server_games(self, guild_id: str) -> List[sqlite3.Row]:
+        """Get all games monitored by a server"""
+        with self.get_connection() as conn:
+            return conn.execute(
+                '''SELECT sg.*, g.game_name as verified_name 
+                   FROM server_games sg 
+                   LEFT JOIN games g ON sg.game_id = g.game_id 
+                   WHERE sg.guild_id = ? 
+                   ORDER BY sg.created_at''',
+                (str(guild_id),)
+            ).fetchall()
+    
+    def add_server_game(self, guild_id: str, game_name: str, game_id: str = None, custom_name: str = None) -> bool:
+        """Add a game to a server's monitoring list"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    '''INSERT OR REPLACE INTO server_games 
+                       (guild_id, game_name, game_id, custom_name) 
+                       VALUES (?, ?, ?, ?)''',
+                    (str(guild_id), game_name, game_id, custom_name)
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to add server game: {e}")
+            return False
+    
+    def remove_server_game(self, guild_id: str, game_name: str) -> bool:
+        """Remove a game from a server's monitoring list"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    'DELETE FROM server_games WHERE guild_id = ? AND game_name = ?',
+                    (str(guild_id), game_name)
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to remove server game: {e}")
+            return False
+    
+    # Seen runs management
+    def add_seen_run(self, run_id: str, game_id: str) -> bool:
+        """Mark a run as seen"""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    'INSERT OR IGNORE INTO seen_runs (run_id, game_id) VALUES (?, ?)',
+                    (run_id, game_id)
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to add seen run: {e}")
+            return False
+    
+    def is_run_seen(self, run_id: str) -> bool:
+        """Check if a run has been seen"""
+        with self.get_connection() as conn:
+            result = conn.execute(
+                'SELECT 1 FROM seen_runs WHERE run_id = ?', 
+                (run_id,)
+            ).fetchone()
+            return result is not None
+    
+    def get_all_monitored_games(self) -> List[Tuple[str, str]]:
+        """Get all unique games being monitored by any server"""
+        with self.get_connection() as conn:
+            results = conn.execute('''
+                SELECT DISTINCT sg.game_name, sg.game_id, g.game_name as verified_name
+                FROM server_games sg
+                LEFT JOIN games g ON sg.game_id = g.game_id
+                WHERE sg.guild_id IN (SELECT guild_id FROM servers WHERE enabled = TRUE)
+            ''').fetchall()
+            
+            games = []
+            for row in results:
+                game_name = row['verified_name'] or row['game_name']
+                game_id = row['game_id']
+                if game_id:  # Only include games with verified IDs
+                    games.append((game_id, game_name))
+            return games
+    
+    def get_servers_monitoring_game(self, game_id: str) -> List[sqlite3.Row]:
+        """Get all servers that are monitoring a specific game"""
+        with self.get_connection() as conn:
+            return conn.execute('''
+                SELECT s.*, sg.game_name, sg.custom_name
+                FROM servers s
+                JOIN server_games sg ON s.guild_id = sg.guild_id
+                WHERE sg.game_id = ? AND s.enabled = TRUE AND s.channel_id IS NOT NULL
+            ''', (game_id,)).fetchall()
+    
+    def get_server_stats(self) -> Dict:
+        """Get statistics about servers and games"""
+        with self.get_connection() as conn:
+            stats = {}
+            
+            # Server stats
+            server_stats = conn.execute('''
+                SELECT 
+                    COUNT(*) as total_servers,
+                    SUM(CASE WHEN enabled = TRUE THEN 1 ELSE 0 END) as enabled_servers,
+                    SUM(CASE WHEN channel_id IS NOT NULL THEN 1 ELSE 0 END) as configured_servers
+                FROM servers
+            ''').fetchone()
+            
+            stats.update(dict(server_stats))
+            
+            # Game stats
+            game_stats = conn.execute('''
+                SELECT 
+                    COUNT(DISTINCT game_id) as unique_games,
+                    COUNT(*) as total_monitoring_relationships
+                FROM server_games 
+                WHERE game_id IS NOT NULL
+            ''').fetchone()
+            
+            stats.update(dict(game_stats))
+            
+            return stats
 
-bot_config = load_config()
-
-# Global variables for current context (will be set per server during operations)
-current_server_config = None
-last_announced_runs = []
+# Initialize database
+db = DatabaseManager(DATABASE_FILE)
 
 # ---------------------- TIME FORMATTING ----------------------
 def format_time(seconds):
@@ -153,7 +393,10 @@ intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
 intents.message_content = True
+intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Remove default help command to use our custom one
 bot.remove_command("help")
 
 # ---------------------- ENHANCED HELPERS ----------------------
@@ -172,14 +415,6 @@ async def fetch_json(session, url):
     except Exception as e:
         logger.error(f"❌ Error fetching {url}: {e}")
         return None
-
-def save_seen_runs():
-    try:
-        with open(SEEN_RUNS_FILE, "w") as f:
-            json.dump(list(seen_runs), f)
-        logger.info(f"💾 Saved {len(seen_runs)} seen runs to history")
-    except Exception as e:
-        logger.error(f"❌ Failed to save seen runs: {e}")
 
 async def get_player_name(session, player):
     if not player:
@@ -264,48 +499,85 @@ async def get_detailed_category_info(session, run):
         logger.error(f"❌ Error getting category info: {e}")
         return "Unknown Category"
 
-# ---------------------- ENHANCED GAME DETECTION ----------------------
-async def find_game_id(session, game_name):
-    """Enhanced game finding with better search"""
-    # Try exact match first
-    exact_url = f"{BASE_URL}/games?name={game_name.replace(' ', '%20')}&max=10"
-    data = await fetch_json(session, exact_url)
+# ---------------------- GAME VERIFICATION SYSTEM ----------------------
+class GameVerificationSystem:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    async def search_games(self, session, game_name: str, limit: int = 5) -> List[Dict]:
+        """Search for games on speedrun.com"""
+        # Check cache first
+        cached_results = self.db.search_games_cache(game_name)
+        if cached_results:
+            logger.info(f"🎮 Using cached results for: {game_name}")
+            return cached_results[:limit]
+        
+        # Search API
+        search_url = f"{BASE_URL}/games?name={game_name.replace(' ', '%20')}&max=20"
+        data = await fetch_json(session, search_url)
+        
+        if not data or "data" not in data:
+            return []
+        
+        matches = []
+        for game in data["data"]:
+            match_info = {
+                "id": game["id"],
+                "name": game["names"]["international"],
+                "exact_match": game["names"]["international"].lower() == game_name.lower(),
+                "partial_match": game_name.lower() in game["names"]["international"].lower(),
+                "abbreviation": game.get("abbreviation", ""),
+                "release_year": game.get("released", ""),
+                "players": game.get("players", ""),
+                "links": game.get("links", [])
+            }
+            matches.append(match_info)
+        
+        # Cache results
+        self.db.cache_game_search(game_name, matches)
+        
+        # Sort by match quality
+        matches.sort(key=lambda x: (not x["exact_match"], not x["partial_match"]))
+        return matches[:limit]
+    
+    async def verify_and_add_game(self, session, game_name: str, game_id: str) -> bool:
+        """Verify a game and add to database"""
+        # Get full game data
+        game_url = f"{BASE_URL}/games/{game_id}"
+        game_data = await fetch_json(session, game_url)
+        
+        if not game_data or "data" not in game_data:
+            return False
+        
+        game = game_data["data"]
+        success = self.db.add_game(
+            game_id=game["id"],
+            game_name=game["names"]["international"],
+            abbreviation=game.get("abbreviation"),
+            release_year=game.get("released"),
+            players=game.get("players"),
+            links=game.get("links", [])
+        )
+        
+        return success
 
-    if not data or "data" not in data:
-        return None, None
+# Initialize game verification
+game_verifier = GameVerificationSystem(db)
 
-    # Look for exact match first
-    for game in data["data"]:
-        if game["names"]["international"].lower() == game_name.lower():
-            logger.info(f"🎯 Exact match found: {game_name} -> {game['names']['international']} (ID: {game['id']})")
-            return game["id"], game["names"]["international"]
-
-    # Look for partial matches
-    for game in data["data"]:
-        if game_name.lower() in game["names"]["international"].lower():
-            logger.info(f"🔍 Partial match: {game_name} -> {game['names']['international']} (ID: {game['id']})")
-            return game["id"], game["names"]["international"]
-
-    # Use first result if no good match found
-    if data["data"]:
-        game = data["data"][0]
-        logger.info(f"📝 Using first result: {game_name} -> {game['names']['international']} (ID: {game['id']})")
-        return game["id"], game["names"]["international"]
-
-    return None, None
-
-# ---------------------- NOTIFICATION ----------------------
-async def notify_new_run(session, run, game_name, server_config):
-    """Notify a specific server about a new run"""
+# ---------------------- NOTIFICATION SYSTEM ----------------------
+async def notify_new_run(session, run, game_id: str, game_name: str):
+    """Notify all servers monitoring this game about a new run"""
     try:
         run_id = run.get("id")
-        if not run_id or run_id in seen_runs:
+        if not run_id or db.is_run_seen(run_id):
             return
 
-        # Skip if server has disabled notifications
-        if not server_config.get("enabled", True):
+        # Get servers monitoring this game
+        servers = db.get_servers_monitoring_game(game_id)
+        if not servers:
             return
 
+        # Get full run details
         run_url = f"{BASE_URL}/runs/{run_id}?embed=category,level,variables,platform"
         full_run_resp = await fetch_json(session, run_url)
         full_run = full_run_resp["data"] if full_run_resp and "data" in full_run_resp else run
@@ -313,7 +585,6 @@ async def notify_new_run(session, run, game_name, server_config):
         detailed_category = await get_detailed_category_info(session, full_run)
         runner = await get_player_name(session, full_run.get("players", [{}])[0])
         
-        # Format the time properly
         raw_time = full_run.get("times", {}).get("primary_t")
         run_time = format_time(raw_time) if raw_time else "Unknown"
         
@@ -321,6 +592,7 @@ async def notify_new_run(session, run, game_name, server_config):
         submitted = full_run.get("submitted", "Unknown")
         weblink = full_run.get("weblink", "https://www.speedrun.com")
 
+        # Create embed
         embed = discord.Embed(
             title=f"🚨 New {game_name} Speedrun Needs Verification!",
             url=weblink,
@@ -340,164 +612,509 @@ async def notify_new_run(session, run, game_name, server_config):
             if video_link:
                 embed.add_field(name="▶️ Video", value=f"[Watch Here]({video_link})", inline=False)
 
-        if full_run.get("players"):
-            player = full_run["players"][0]
-            if player.get("rel") == "user" and "id" in player:
-                user_data = await fetch_json(session, f"{BASE_URL}/users/{player['id']}")
-                if user_data and "data" in user_data:
-                    assets = user_data["data"].get("assets", {})
-                    image_url = assets.get("image", {}).get("uri")
-                    if image_url:
-                        embed.set_thumbnail(url=image_url)
-
-        channel_id = server_config.get("channel_id")
-        if channel_id:
+        # Notify each server
+        notified_servers = 0
+        for server in servers:
             try:
-                channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                channel = bot.get_channel(int(server['channel_id']))
                 if channel:
-                    role_id = server_config.get("role_id")
+                    role_id = server['role_id']
                     ping_text = f"<@&{role_id}>" if role_id else None
                     await channel.send(content=ping_text, embed=embed)
-                    seen_runs.add(run_id)
-                    save_seen_runs()
-                    logger.info(f"📢 Notified server {channel.guild.name} about new run: {game_name} by {runner}")
-                else:
-                    logger.warning(f"❌ Channel {channel_id} not found for server")
-            except discord.Forbidden:
-                logger.warning(f"❌ No permission to send messages in channel {channel_id}")
+                    notified_servers += 1
+                    logger.info(f"📢 Notified {server['guild_name']} about run {run_id}")
             except Exception as e:
-                logger.error(f"❌ Error sending notification to server: {e}")
+                logger.error(f"❌ Failed to notify server {server['guild_name']}: {e}")
+
+        # Mark as seen if at least one server was notified
+        if notified_servers > 0:
+            db.add_seen_run(run_id, game_id)
+            logger.info(f"✅ Notified {notified_servers} servers about new run for {game_name}")
 
     except Exception as e:
         logger.error(f"❌ Error notifying run {run.get('id')}: {e}")
 
-# ---------------------- ENHANCED CHECK RUNS ----------------------
+# ---------------------- CHECK RUNS ----------------------
 async def check_new_runs():
-    """Check for new runs and notify all configured servers"""
-    logger.info("🔍 Starting run check for all servers...")
-    total_new_runs = 0
-    servers_notified = 0
-
+    """Check for new runs across all monitored games"""
+    logger.info("🔍 Starting run check...")
+    
+    # Get all unique games being monitored
+    monitored_games = db.get_all_monitored_games()
+    if not monitored_games:
+        logger.info("ℹ️ No games being monitored by any server")
+        return
+    
+    logger.info(f"🎮 Checking {len(monitored_games)} games across all servers")
+    
     async with aiohttp.ClientSession() as session:
-        # Get all unique games from all server configurations
-        all_games = set()
-        for server_id, server_config in bot_config["servers"].items():
-            if server_config.get("enabled", True) and server_config.get("channel_id"):
-                all_games.update(server_config.get("games", []))
-
-        if not all_games:
-            logger.info("ℹ️ No enabled servers with configured games")
-            return
-
-        logger.info(f"🎮 Checking games for all servers: {', '.join(all_games)}")
-
-        for game_name in all_games:
-            logger.info(f"🎮 Checking game: {game_name}")
-
-            game_id, game_name_actual = await find_game_id(session, game_name)
-
-            if not game_id:
-                logger.warning(f"❌ Could not find game: {game_name}")
-                continue
-
+        for game_id, game_name in monitored_games:
+            logger.info(f"🔎 Checking {game_name} (ID: {game_id})")
+            
             runs_url = f"{BASE_URL}/runs?game={game_id}&status=new&max=20&orderby=submitted&direction=desc"
             runs_data = await fetch_json(session, runs_url)
-
+            
             if not runs_data or "data" not in runs_data:
-                logger.info(f"ℹ️ No runs data for {game_name_actual}")
+                logger.info(f"ℹ️ No runs data for {game_name}")
                 continue
-
-            new_runs = [r for r in runs_data["data"] if r.get("id") not in seen_runs]
-
+            
+            new_runs = [r for r in runs_data["data"] if not db.is_run_seen(r.get("id", ""))]
+            
             if new_runs:
-                logger.info(f"✅ Found {len(new_runs)} new runs for {game_name_actual}")
-                total_new_runs += len(new_runs)
-                
-                # Notify all servers that are monitoring this game
+                logger.info(f"✅ Found {len(new_runs)} new runs for {game_name}")
                 for run in new_runs:
-                    for server_id, server_config in bot_config["servers"].items():
-                        if (server_config.get("enabled", True) and 
-                            server_config.get("channel_id") and 
-                            game_name in server_config.get("games", [])):
-                            await notify_new_run(session, run, game_name_actual, server_config)
-                            servers_notified += 1
+                    await notify_new_run(session, run, game_id, game_name)
             else:
-                logger.info(f"ℹ️ No new runs for {game_name_actual}")
-
-    if total_new_runs > 0:
-        logger.info(f"🎉 Check complete! Found {total_new_runs} new runs, notified {servers_notified} server instances")
-    else:
-        logger.info("🔍 Check complete! No new runs found")
+                logger.info(f"ℹ️ No new runs for {game_name}")
+    
+    logger.info("✅ Run check complete")
 
 # ---------------------- TASK LOOP ----------------------
-@tasks.loop(seconds=60)  # Default interval, will be adjusted per server config
+@tasks.loop(seconds=60)
 async def monitor_runs():
     await check_new_runs()
 
-# ---------------------- COMPLETE COMMANDS ----------------------
+# ---------------------- BOT COMMANDS ----------------------
+@bot.event
+async def on_guild_join(guild):
+    """Automatically create server record when bot joins a guild"""
+    db.create_server(str(guild.id), guild.name)
+    logger.info(f"🤖 Joined new guild: {guild.name} ({guild.id})")
+
+@bot.event
+async def on_guild_remove(guild):
+    """Handle bot removal from guild"""
+    logger.info(f"🤖 Removed from guild: {guild.name} ({guild.id})")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setup(ctx):
+    """Initial setup command for the server"""
+    # Create server record if it doesn't exist
+    server = db.get_server(str(ctx.guild.id))
+    if not server:
+        db.create_server(str(ctx.guild.id), ctx.guild.name)
+    
+    embed = discord.Embed(
+        title="🤖 Speedrun Bot Setup",
+        description="Welcome! Let's get your server configured.",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="📋 Setup Steps",
+        value="1. Set notification channel: `!setchannel`\n"
+              "2. Add games to monitor: `!addgame \"Game Name\"`\n"
+              "3. Optional: Set ping role: `!setrole @role`\n"
+              "4. Optional: Adjust check interval: `!interval 60`",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setchannel(ctx):
     """Set notification channel for this server"""
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"channel_id": ctx.channel.id})
+    db.update_server(str(ctx.guild.id), channel_id=str(ctx.channel.id))
     
-    logger.info(f"📢 Notification channel set to: {ctx.channel.id} for server {ctx.guild.name}")
-    await ctx.send(f"✅ Notifications will now be sent to this channel for server **{ctx.guild.name}**.")
+    embed = discord.Embed(
+        title="✅ Channel Set",
+        description=f"Notifications will be sent to {ctx.channel.mention}",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setrole(ctx, role: discord.Role):
     """Set ping role for this server"""
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"role_id": role.id})
+    db.update_server(str(ctx.guild.id), role_id=str(role.id))
     
-    logger.info(f"🔔 Ping role set to: {role.name} (ID: {role.id}) for server {ctx.guild.name}")
-    await ctx.send(f"✅ Role {role.mention} will now be pinged for new runs in server **{ctx.guild.name}**.")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setgames(ctx, *games):
-    """Set games to monitor for this server"""
-    if not games:
-        await ctx.send("❌ Please specify at least one game. Example: `!setgames \"Game 1\" \"Game 2\"`")
-        return
-    
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"games": list(games)})
-    
-    logger.info(f"🎮 Games updated for server {ctx.guild.name}: {', '.join(games)}")
-    await ctx.send(f"✅ Now monitoring games for server **{ctx.guild.name}**: {', '.join(games)}")
+    embed = discord.Embed(
+        title="✅ Role Set",
+        description=f"Ping role set to {role.mention}",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def interval(ctx, seconds: int):
     """Set check interval for this server"""
     if seconds < 30:
-        await ctx.send("❌ Interval must be at least 30 seconds to avoid rate limiting.")
+        await ctx.send("❌ Interval must be at least 30 seconds")
         return
-        
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"interval": seconds})
     
-    logger.info(f"⏰ Check interval set to: {seconds} seconds for server {ctx.guild.name}")
-    await ctx.send(f"✅ Monitoring interval set to {seconds} seconds for server **{ctx.guild.name}**.")
+    db.update_server(str(ctx.guild.id), interval=seconds)
+    
+    embed = discord.Embed(
+        title="✅ Interval Set",
+        description=f"Check interval set to {seconds} seconds",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addgame(ctx, *game_names):
+    """Add one or multiple games to monitor with smart verification"""
+    if not game_names:
+        embed = discord.Embed(
+            title="❌ Missing Game Names",
+            description="Please specify one or more games to add.\n\n**Examples:**\n`!addgame \"Celeste\"`\n`!addgame \"Celeste\" \"Hollow Knight\" \"Super Meat Boy\"`",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    # Limit the number of games that can be added at once
+    if len(game_names) > 10:
+        embed = discord.Embed(
+            title="❌ Too Many Games",
+            description="Please add no more than 10 games at a time to avoid rate limiting.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    embed = discord.Embed(
+        title="🔍 Searching for Games...",
+        description=f"Searching for {len(game_names)} game(s) on speedrun.com...",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Games to Add", value="\n".join([f"• {name}" for name in game_names]), inline=False)
+    
+    message = await ctx.send(embed=embed)
+    
+    results = {
+        'success': [],
+        'multiple_matches': [],
+        'not_found': [],
+        'already_added': []
+    }
+    
+    # Get current games to check for duplicates
+    current_games = db.get_server_games(str(ctx.guild.id))
+    current_game_names = [game['game_name'].lower() for game in current_games]
+    
+    async with aiohttp.ClientSession() as session:
+        for game_name in game_names:
+            # Check if game is already added
+            if game_name.lower() in current_game_names:
+                results['already_added'].append(game_name)
+                continue
+            
+            matches = await game_verifier.search_games(session, game_name, limit=5)
+            
+            if not matches:
+                results['not_found'].append(game_name)
+                continue
+            
+            # Check for exact match
+            exact_matches = [m for m in matches if m['exact_match']]
+            if exact_matches:
+                # Auto-select exact match
+                selected = exact_matches[0]
+                success = await game_verifier.verify_and_add_game(session, game_name, selected["id"])
+                if success:
+                    db.add_server_game(str(ctx.guild.id), game_name, selected["id"])
+                    results['success'].append(f"**{game_name}** → {selected['name']}")
+                else:
+                    results['not_found'].append(game_name)
+            elif len(matches) == 1:
+                # Single match (not exact)
+                selected = matches[0]
+                success = await game_verifier.verify_and_add_game(session, game_name, selected["id"])
+                if success:
+                    db.add_server_game(str(ctx.guild.id), game_name, selected["id"])
+                    results['success'].append(f"**{game_name}** → {selected['name']} (close match)")
+                else:
+                    results['not_found'].append(game_name)
+            else:
+                # Multiple matches - store for interactive selection
+                results['multiple_matches'].append({
+                    'search_term': game_name,
+                    'matches': matches
+                })
+    
+    # Create results embed
+    result_embed = discord.Embed(
+        title="✅ Game Addition Results",
+        color=discord.Color.green() if results['success'] else discord.Color.orange()
+    )
+    
+    if results['success']:
+        result_embed.add_field(
+            name="✅ Successfully Added",
+            value="\n".join(results['success']),
+            inline=False
+        )
+    
+    if results['already_added']:
+        result_embed.add_field(
+            name="ℹ️ Already Added",
+            value="\n".join([f"• {name}" for name in results['already_added']]),
+            inline=False
+        )
+    
+    if results['not_found']:
+        result_embed.add_field(
+            name="❌ Not Found",
+            value="\n".join([f"• {name}" for name in results['not_found']]),
+            inline=False
+        )
+    
+    if results['multiple_matches']:
+        result_embed.add_field(
+            name="🔍 Needs Selection",
+            value=f"Found multiple matches for {len(results['multiple_matches'])} game(s). Use the reactions below to select the correct ones.",
+            inline=False
+        )
+    
+    await message.edit(embed=result_embed)
+    
+    # Handle multiple matches with interactive selection
+    if results['multiple_matches']:
+        for i, match_data in enumerate(results['multiple_matches']):
+            game_name = match_data['search_term']
+            matches = match_data['matches']
+            
+            selection_embed = discord.Embed(
+                title=f"🎮 Multiple Matches Found: {game_name}",
+                description="Please react with the number of the correct game:",
+                color=discord.Color.blue()
+            )
+            
+            for j, match in enumerate(matches[:5], 1):
+                status = "✅ Exact" if match["exact_match"] else "🔍 Partial"
+                selection_embed.add_field(
+                    name=f"{j}. {match['name']} {status}",
+                    value=f"Year: {match.get('release_year', 'N/A')} | Players: {match.get('players', 'N/A')}",
+                    inline=False
+                )
+            
+            selection_embed.add_field(
+                name="❌ Skip",
+                value="React with ❌ to skip this game",
+                inline=False
+            )
+            
+            selection_msg = await ctx.send(embed=selection_embed)
+            
+            numbers = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"][:len(matches)]
+            for emoji in numbers + ["❌"]:
+                await selection_msg.add_reaction(emoji)
+            
+            def check(reaction, user):
+                return user == ctx.author and str(reaction.emoji) in numbers + ["❌"] and reaction.message.id == selection_msg.id
+            
+            try:
+                reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+                
+                if str(reaction.emoji) == "❌":
+                    skip_embed = discord.Embed(
+                        description=f"⏭️ Skipped game: **{game_name}**",
+                        color=discord.Color.orange()
+                    )
+                    await selection_msg.edit(embed=skip_embed)
+                    continue
+                
+                index = numbers.index(str(reaction.emoji))
+                selected = matches[index]
+                
+                # Verify and add the selected game
+                success = await game_verifier.verify_and_add_game(session, game_name, selected["id"])
+                if success:
+                    db.add_server_game(str(ctx.guild.id), game_name, selected["id"])
+                    
+                    success_embed = discord.Embed(
+                        title="✅ Game Added",
+                        description=f"**{game_name}** → {selected['name']}",
+                        color=discord.Color.green()
+                    )
+                    await selection_msg.edit(embed=success_embed)
+                else:
+                    error_embed = discord.Embed(
+                        title="❌ Error",
+                        description=f"Failed to add **{game_name}**",
+                        color=discord.Color.red()
+                    )
+                    await selection_msg.edit(embed=error_embed)
+                
+            except asyncio.TimeoutError:
+                timeout_embed = discord.Embed(
+                    description=f"⏰ Selection timed out for: **{game_name}**",
+                    color=discord.Color.orange()
+                )
+                await selection_msg.edit(embed=timeout_embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addgames(ctx, *game_names):
+    """Quickly add multiple games (auto-selects first match)"""
+    if not game_names:
+        embed = discord.Embed(
+            title="❌ Missing Game Names",
+            description="Please specify games to add.\n\n**Example:**\n`!addgames \"Celeste\" \"Hollow Knight\" \"Super Meat Boy\"`",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    if len(game_names) > 15:
+        embed = discord.Embed(
+            title="❌ Too Many Games",
+            description="Please add no more than 15 games at a time.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    embed = discord.Embed(
+        title="⚡ Quick-Adding Games...",
+        description=f"Quickly adding {len(game_names)} game(s) (using first match)...",
+        color=discord.Color.blue()
+    )
+    
+    message = await ctx.send(embed=embed)
+    
+    results = {
+        'added': [],
+        'failed': [],
+        'duplicates': []
+    }
+    
+    current_games = db.get_server_games(str(ctx.guild.id))
+    current_game_names = [game['game_name'].lower() for game in current_games]
+    
+    async with aiohttp.ClientSession() as session:
+        for game_name in game_names:
+            if game_name.lower() in current_game_names:
+                results['duplicates'].append(game_name)
+                continue
+            
+            matches = await game_verifier.search_games(session, game_name, limit=1)
+            
+            if matches:
+                selected = matches[0]
+                success = await game_verifier.verify_and_add_game(session, game_name, selected["id"])
+                if success:
+                    db.add_server_game(str(ctx.guild.id), game_name, selected["id"])
+                    match_type = "exact" if selected['exact_match'] else "close"
+                    results['added'].append(f"**{game_name}** → {selected['name']} ({match_type} match)")
+                else:
+                    results['failed'].append(game_name)
+            else:
+                results['failed'].append(game_name)
+    
+    # Create results embed
+    result_embed = discord.Embed(
+        title="✅ Quick-Add Results",
+        color=discord.Color.green() if results['added'] else discord.Color.orange()
+    )
+    
+    if results['added']:
+        result_embed.add_field(
+            name="✅ Added Games",
+            value="\n".join(results['added'][:10]),  # Limit to first 10
+            inline=False
+        )
+        if len(results['added']) > 10:
+            result_embed.add_field(
+                name="ℹ️ Note",
+                value=f"And {len(results['added']) - 10} more games were added.",
+                inline=False
+            )
+    
+    if results['duplicates']:
+        result_embed.add_field(
+            name="ℹ️ Already Added",
+            value=", ".join(results['duplicates'][:5]),
+            inline=False
+        )
+    
+    if results['failed']:
+        result_embed.add_field(
+            name="❌ Not Found",
+            value=", ".join(results['failed'][:5]),
+            inline=False
+        )
+        if len(results['failed']) > 5:
+            result_embed.add_field(
+                name="ℹ️ Note",
+                value=f"And {len(results['failed']) - 5} more games not found.",
+                inline=False
+            )
+    
+    await message.edit(embed=result_embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removegame(ctx, *, game_name: str):
+    """Remove a game from monitoring"""
+    success = db.remove_server_game(str(ctx.guild.id), game_name)
+    
+    if success:
+        embed = discord.Embed(
+            title="✅ Game Removed",
+            description=f"**{game_name}** is no longer being monitored",
+            color=discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="❌ Error",
+            description=f"Game '{game_name}' not found in your list",
+            color=discord.Color.red()
+        )
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def listgames(ctx):
+    """List all games being monitored by this server"""
+    games = db.get_server_games(str(ctx.guild.id))
+    
+    embed = discord.Embed(
+        title=f"🎮 Monitored Games - {ctx.guild.name}",
+        color=discord.Color.blue()
+    )
+    
+    if not games:
+        embed.description = "No games being monitored. Use `!addgame` to add games."
+    else:
+        for game in games:
+            status = "✅ Verified" if game['game_id'] else "❓ Unverified"
+            display_name = game['verified_name'] or game['game_name']
+            embed.add_field(
+                name=f"{display_name} {status}",
+                value=f"ID: {game['game_id'] or 'Not verified'}",
+                inline=False
+            )
+    
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def config(ctx):
-    """Show current configuration for this server"""
-    server_config = get_server_config(ctx.guild.id)
+    """Show current server configuration"""
+    server = db.get_server(str(ctx.guild.id))
+    games = db.get_server_games(str(ctx.guild.id))
+    
+    if not server:
+        await ctx.send("❌ Server not configured. Use `!setup` to get started.")
+        return
     
     embed = discord.Embed(
-        title=f"🤖 Bot Configuration - {ctx.guild.name}",
+        title=f"⚙️ Configuration - {ctx.guild.name}",
         color=discord.Color.blue()
     )
-    embed.add_field(name="🎮 Games", value="\n".join(server_config.get("games", [])) or "None", inline=False)
-    embed.add_field(name="👀 Global Seen Runs", value=str(len(seen_runs)), inline=True)
-    embed.add_field(name="⏰ Interval", value=f"{server_config.get('interval', 60)} seconds", inline=True)
-    embed.add_field(name="📢 Channel", value=f"<#{server_config.get('channel_id')}>" if server_config.get("channel_id") else "Not set", inline=True)
-    embed.add_field(name="🔔 Role", value=f"<@&{server_config.get('role_id')}>" if server_config.get("role_id") else "Not set", inline=True)
-    embed.add_field(name="✅ Enabled", value="Yes" if server_config.get("enabled", True) else "No", inline=True)
+    
+    embed.add_field(name="Status", value="✅ Enabled" if server['enabled'] else "❌ Disabled", inline=True)
+    embed.add_field(name="Interval", value=f"{server['interval']} seconds", inline=True)
+    embed.add_field(name="Channel", value=f"<#{server['channel_id']}>" if server['channel_id'] else "Not set", inline=True)
+    embed.add_field(name="Role", value=f"<@&{server['role_id']}>" if server['role_id'] else "Not set", inline=True)
+    embed.add_field(name="Games", value=str(len(games)), inline=True)
+    embed.add_field(name="Server ID", value=server['guild_id'], inline=True)
     
     await ctx.send(embed=embed)
 
@@ -505,107 +1122,168 @@ async def config(ctx):
 @commands.has_permissions(administrator=True)
 async def enable(ctx):
     """Enable notifications for this server"""
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"enabled": True})
-    
-    logger.info(f"✅ Notifications enabled for server {ctx.guild.name}")
-    await ctx.send(f"✅ Notifications enabled for server **{ctx.guild.name}**.")
+    db.update_server(str(ctx.guild.id), enabled=True)
+    await ctx.send("✅ Notifications enabled")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def disable(ctx):
     """Disable notifications for this server"""
-    server_config = get_server_config(ctx.guild.id)
-    update_server_config(ctx.guild.id, {"enabled": False})
-    
-    logger.info(f"❌ Notifications disabled for server {ctx.guild.name}")
-    await ctx.send(f"❌ Notifications disabled for server **{ctx.guild.name}**.")
+    db.update_server(str(ctx.guild.id), enabled=False)
+    await ctx.send("❌ Notifications disabled")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
-async def resetserver(ctx):
-    """Reset configuration for this server to defaults"""
-    update_server_config(ctx.guild.id, DEFAULT_SERVER_CONFIG.copy())
+async def stats(ctx):
+    """Show bot statistics"""
+    stats = db.get_server_stats()
     
-    logger.info(f"🔄 Config reset to defaults for server {ctx.guild.name}")
-    await ctx.send(f"✅ Configuration reset to defaults for server **{ctx.guild.name}**.")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def serverinfo(ctx):
-    """Show information about all servers using this bot"""
-    embed = discord.Embed(title="🌐 Bot Server Information", color=discord.Color.green())
-    
-    total_servers = len(bot_config["servers"])
-    enabled_servers = sum(1 for config in bot_config["servers"].values() if config.get("enabled", True))
-    
-    embed.add_field(name="📊 Total Servers", value=str(total_servers), inline=True)
-    embed.add_field(name="✅ Enabled Servers", value=str(enabled_servers), inline=True)
-    embed.add_field(name="🤖 Bot User", value=bot.user.name, inline=True)
-    
-    # Show configured servers
-    configured_servers = []
-    for server_id, config in bot_config["servers"].items():
-        guild = bot.get_guild(int(server_id))
-        if guild:
-            status = "✅" if config.get("enabled", True) else "❌"
-            games_count = len(config.get("games", []))
-            configured_servers.append(f"{status} {guild.name} ({games_count} games)")
-    
-    if configured_servers:
-        embed.add_field(name="🖥️ Configured Servers", value="\n".join(configured_servers[:10]), inline=False)
-        if len(configured_servers) > 10:
-            embed.add_field(name="ℹ️ Note", value=f"... and {len(configured_servers) - 10} more servers", inline=False)
+    embed = discord.Embed(title="📊 Bot Statistics", color=discord.Color.green())
+    embed.add_field(name="Total Servers", value=stats['total_servers'], inline=True)
+    embed.add_field(name="Enabled Servers", value=stats['enabled_servers'], inline=True)
+    embed.add_field(name="Configured Servers", value=stats['configured_servers'], inline=True)
+    embed.add_field(name="Unique Games", value=stats['unique_games'], inline=True)
+    embed.add_field(name="Total Monitoring", value=stats['total_monitoring_relationships'], inline=True)
     
     await ctx.send(embed=embed)
 
 @bot.command()
-async def test(ctx):
-    """Test if bot is working for this server"""
-    server_config = get_server_config(ctx.guild.id)
-    status = "✅ Enabled" if server_config.get("enabled", True) else "❌ Disabled"
-    channel_set = "✅ Set" if server_config.get("channel_id") else "❌ Not set"
+@commands.has_permissions(administrator=True)
+async def checknow(ctx):
+    """Manually check for new runs"""
+    embed = discord.Embed(description="🔍 Checking for new runs...", color=discord.Color.blue())
+    message = await ctx.send(embed=embed)
     
-    embed = discord.Embed(title="🧪 Bot Test", color=discord.Color.green())
-    embed.add_field(name="Server Status", value=status, inline=True)
-    embed.add_field(name="Channel", value=channel_set, inline=True)
-    embed.add_field(name="Games Monitored", value=str(len(server_config.get("games", []))), inline=True)
-    embed.add_field(name="Bot Response", value="✅ Working!", inline=False)
+    await check_new_runs()
+    
+    embed = discord.Embed(description="✅ Manual check complete", color=discord.Color.green())
+    await message.edit(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setgames(ctx, *games):
+    """Set multiple games at once (replaces current list)"""
+    if not games:
+        await ctx.send("❌ Please specify at least one game. Example: `!setgames \"Game 1\" \"Game 2\"`")
+        return
+    
+    # Remove existing games
+    existing_games = db.get_server_games(str(ctx.guild.id))
+    for game in existing_games:
+        db.remove_server_game(str(ctx.guild.id), game['game_name'])
+    
+    # Add new games
+    added_games = []
+    failed_games = []
+    
+    async with aiohttp.ClientSession() as session:
+        for game_name in games:
+            matches = await game_verifier.search_games(session, game_name, limit=1)
+            if matches:
+                game_id = matches[0]['id']
+                db.add_server_game(str(ctx.guild.id), game_name, game_id)
+                added_games.append(f"✅ {game_name} → {matches[0]['name']}")
+            else:
+                db.add_server_game(str(ctx.guild.id), game_name)
+                failed_games.append(f"❓ {game_name} (needs verification)")
+    
+    embed = discord.Embed(title="🎮 Games Updated", color=discord.Color.green())
+    if added_games:
+        embed.add_field(name="Added Games", value="\n".join(added_games), inline=False)
+    if failed_games:
+        embed.add_field(name="Games Needing Verification", value="\n".join(failed_games), inline=False)
     
     await ctx.send(embed=embed)
-
-# ... (keep the existing invite, help, checknow commands unchanged, but update help text)
 
 @bot.command()
 async def help(ctx):
     """Show help message with all commands"""
     embed = discord.Embed(
-        title="📖 Speedrun Bot Help - Multi-Server",
-        description="This bot supports multiple servers with independent configurations!",
+        title="📖 Speedrun Bot Help",
+        description="A multi-server bot for monitoring speedrun.com verification queues",
         color=discord.Color.blue()
     )
-
+    
     commands_list = [
         ("!help", "Show this help message"),
-        ("!test", "Test bot functionality for this server"),
-        ("!config", "Show current settings for this server"),
-        ("!serverinfo", "Show info about all servers using this bot"),
-        ("!setchannel", "Set notification channel (Server-specific)"),
-        ("!setrole @role", "Set ping role (Server-specific)"),
-        ("!setgames game1 game2", "Set games to monitor (Server-specific)"),
-        ("!interval seconds", "Set check interval (Server-specific)"),
+        ("!setup", "Initial server setup wizard"),
+        ("!config", "Show current server configuration"),
+        ("!setchannel", "Set notification channel for this server"),
+        ("!setrole @role", "Set role to ping for new runs"),
+        ("!interval <seconds>", "Set check interval (min 30 seconds)"),
+        ("!addgame \"Game1\" \"Game2\" ...", "Add multiple games with interactive verification"),
+        ("!addgames \"Game1\" \"Game2\" ...", "Quick-add multiple games (auto-selects first match)"),
+        ("!setgames \"Game1\" \"Game2\" ...", "Replace all games with new list"),
+        ("!removegame \"Game Name\"", "Remove a game from monitoring"),
+        ("!listgames", "List all games being monitored"),
         ("!enable", "Enable notifications for this server"),
         ("!disable", "Disable notifications for this server"),
-        ("!resetserver", "Reset this server's configuration to defaults"),
         ("!checknow", "Manually check for new runs immediately"),
-        ("!invite", "Get bot invite link for other servers"),
-        ("!resetseen", "Clear global seen runs history (Admin only)")
+        ("!stats", "Show bot statistics across all servers"),
+        ("!invite", "Get bot invite link"),
+        ("!test", "Test bot functionality")
     ]
-
+    
     for cmd, desc in commands_list:
         embed.add_field(name=cmd, value=desc, inline=False)
+    
+    embed.add_field(
+        name="🎮 Game Adding Tips",
+        value="• Use quotes for games with spaces: `!addgame \"Hollow Knight\"`\n• For multiple games: `!addgame \"Celeste\" \"Hollow Knight\" \"Super Meat Boy\"`\n• Use `!addgames` for faster bulk adding",
+        inline=False
+    )
+    
+    embed.set_footer(text="Admin permissions required for configuration commands")
+    await ctx.send(embed=embed)
 
-    embed.set_footer(text="Server-specific commands affect only the current server")
+@bot.command()
+async def invite(ctx):
+    """Generate bot invite link"""
+    permissions = discord.Permissions()
+    permissions.read_messages = True
+    permissions.send_messages = True
+    permissions.embed_links = True
+    permissions.attach_files = True
+    permissions.read_message_history = True
+    permissions.mention_everyone = False
+    permissions.use_external_emojis = True
+    permissions.add_reactions = True
+    
+    invite_url = discord.utils.oauth_url(bot.user.id, permissions=permissions)
+    
+    embed = discord.Embed(
+        title="🤖 Bot Invite Link",
+        description="Use this link to add the bot to other servers:",
+        color=discord.Color.green()
+    )
+    embed.add_field(
+        name="🔗 Invite URL",
+        value=f"[Click here to invite]({invite_url})",
+        inline=False
+    )
+    embed.add_field(
+        name="📋 Required Permissions",
+        value="• Read Messages\n• Send Messages\n• Embed Links\n• Read Message History\n• Add Reactions",
+        inline=True
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def test(ctx):
+    """Test command to check if bot is responsive"""
+    server = db.get_server(str(ctx.guild.id))
+    status = "✅ Configured" if server and server['channel_id'] else "❌ Not configured"
+    
+    embed = discord.Embed(title="🧪 Bot Test", color=discord.Color.green())
+    embed.add_field(name="Bot Status", value="✅ Online and responsive", inline=True)
+    embed.add_field(name="Server Status", value=status, inline=True)
+    embed.add_field(name="Response Time", value="✅ Immediate", inline=True)
+    
+    if server:
+        games = db.get_server_games(str(ctx.guild.id))
+        embed.add_field(name="Monitored Games", value=str(len(games)), inline=True)
+        embed.add_field(name="Check Interval", value=f"{server['interval']} seconds", inline=True)
+    
     await ctx.send(embed=embed)
 
 # ---------------------- ON READY ----------------------
@@ -613,23 +1291,33 @@ async def help(ctx):
 async def on_ready():
     logger.info("=" * 50)
     logger.info(f"🤖 Bot is ready! Logged in as {bot.user}")
-    logger.info(f"🆔 Bot ID: {bot.user.id}")
-    logger.info(f"📊 Connected to {len(bot.guilds)} guild(s)")
     
-    # Log server configurations
-    enabled_servers = sum(1 for config in bot_config["servers"].values() if config.get("enabled", True))
-    configured_servers = sum(1 for config in bot_config["servers"].values() if config.get("channel_id"))
-    
-    logger.info(f"🌐 {enabled_servers} servers enabled, {configured_servers} servers configured")
-    
+    # Create server records for all current guilds
     for guild in bot.guilds:
-        server_config = get_server_config(guild.id)
-        status = "✅" if server_config.get("enabled", True) else "❌"
-        logger.info(f"🖥️ {status} {guild.name} (ID: {guild.id})")
+        if not db.get_server(str(guild.id)):
+            db.create_server(str(guild.id), guild.name)
     
+    stats = db.get_server_stats()
+    logger.info(f"🌐 Servers: {stats['total_servers']} total, {stats['enabled_servers']} enabled")
+    logger.info(f"🎮 Games: {stats['unique_games']} unique, {stats['total_monitoring_relationships']} relationships")
     logger.info("=" * 50)
-
+    
     monitor_runs.start()
+
+# ---------------------- ERROR HANDLING ----------------------
+@bot.event
+async def on_command_error(ctx, error):
+    """Handle command errors gracefully"""
+    if isinstance(error, commands.CommandNotFound):
+        # Suggest similar commands or show help
+        await ctx.send(f"❌ Command not found. Use `!help` to see all available commands.")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You don't have permission to use this command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing required argument. Usage: `!{ctx.command.name} {ctx.command.signature}`")
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send("❌ An error occurred while executing the command.")
 
 # ---------------------- RUN BOT ----------------------
 if __name__ == "__main__":
