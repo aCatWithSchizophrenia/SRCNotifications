@@ -1,6 +1,6 @@
 #  __**SRC notifier**__ 
 
-Small discord bot that sends messages if new Destiny 2 runs are submitted to be verified. Might add more features. 
+Small discord bot that sends messages if new Destiny 2 runs are submitted to be verified. Might add more features. Only works with a single server for multiple servers use [Multi-Server](https://github.com/aCatWithSchizophrenia/SRCNotifications-Multiserver)
 
 # Requirements
 
