@@ -45,6 +45,7 @@ Guide:
 
   3. Paste your Token in the .env
 <img width="754" height="39" alt="image" src="https://github.com/user-attachments/assets/960dbde5-2cb7-4531-aabc-c4b22fda288b" />
+  
   4. run the code
   5. go to the channel you want the bot to post in and use !setchannel
 
